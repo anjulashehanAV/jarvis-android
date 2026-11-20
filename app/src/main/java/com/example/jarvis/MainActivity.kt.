@@ -1,0 +1,494 @@
+package com.example.jarvis
+
+import android.Manifest
+import android.app.AlarmManager
+import android.app.PendingIntent
+import android.content.ActivityNotFoundException
+import android.content.Context
+import android.content.Intent
+import android.content.SharedPreferences
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.provider.ContactsContract
+import android.speech.RecognizerIntent
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
+import android.telecom.TelecomManager
+import android.view.inputmethod.EditorInfo
+import android.widget.Button
+import android.widget.EditText
+import android.widget.ScrollView
+import android.widget.TextView
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
+import org.json.JSONArray
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
+import java.time.LocalDate
+import java.time.LocalTime
+import java.time.format.DateTimeFormatter
+import java.util.Locale
+
+class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
+
+    private lateinit var logView: TextView
+    private lateinit var scroll: ScrollView
+    private lateinit var input: EditText
+    private lateinit var prefs: SharedPreferences
+
+    private var tts: TextToSpeech? = null
+    private var ttsReady = false
+    private val queued = mutableListOf<String>()
+
+    // Conversation state: null, "call_name" or "call_confirm"
+    private var awaiting: String? = null
+    private var pendingName = ""
+    private var pendingNumber = ""
+    private var listening = false
+
+    private val speechLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            listening = false
+            val text = result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()
+            if (result.resultCode == RESULT_OK && !text.isNullOrBlank()) onUser(text) else awaiting = null
+        }
+
+    private val permLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+        prefs = getSharedPreferences("jarvis", Context.MODE_PRIVATE)
+        logView = findViewById(R.id.log)
+        scroll = findViewById(R.id.scroll)
+        input = findViewById(R.id.input)
+        tts = TextToSpeech(this, this)
+
+        findViewById<Button>(R.id.mic).setOnClickListener { listen() }
+        findViewById<Button>(R.id.send).setOnClickListener { submit() }
+        input.setOnEditorActionListener { _, actionId, _ ->
+            if (actionId == EditorInfo.IME_ACTION_SEND) { submit(); true } else false
+        }
+
+        askPermissions()
+        val h = LocalTime.now().hour
+        val greet = if (h < 12) "Good morning" else if (h < 18) "Good afternoon" else "Good evening"
+        say("$greet. Jarvis is online. Tap the button and speak, or say help.")
+    }
+
+    override fun onDestroy() {
+        tts?.stop()
+        tts?.shutdown()
+        super.onDestroy()
+    }
+
+    // ---------------------------------------------------------------- voice
+
+    override fun onInit(status: Int) {
+        if (status != TextToSpeech.SUCCESS) return
+        val r = tts?.setLanguage(Locale.getDefault())
+        if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
+            tts?.setLanguage(Locale.US)
+        }
+        tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) {}
+            override fun onError(utteranceId: String?) {}
+            override fun onDone(utteranceId: String?) {
+                runOnUiThread {
+                    if (awaiting != null && tts?.isSpeaking != true) listen()
+                }
+            }
+        })
+        ttsReady = true
+        queued.forEach { speak(it) }
+        queued.clear()
+    }
+
+    private fun speak(text: String) {
+        if (!ttsReady) { queued.add(text); return }
+        tts?.speak(text, TextToSpeech.QUEUE_ADD, null, "j" + System.nanoTime())
+    }
+
+    private fun listen() {
+        if (listening) return
+        listening = true
+        val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_PROMPT, "Listening...")
+        }
+        try {
+            speechLauncher.launch(i)
+        } catch (e: ActivityNotFoundException) {
+            listening = false
+            awaiting = null
+            say("Speech recognition isn't available on this device. Install or enable the Google app, or type instead.")
+        }
+    }
+
+    // ---------------------------------------------------------------- I/O
+
+    private fun submit() {
+        val t = input.text.toString().trim()
+        if (t.isEmpty()) return
+        input.setText("")
+        onUser(t)
+    }
+
+    private fun append(line: String) {
+        logView.append(line + "\n\n")
+        scroll.post { scroll.fullScroll(ScrollView.FOCUS_DOWN) }
+    }
+
+    private fun say(text: String) {
+        append("Jarvis: $text")
+        speak(text)
+    }
+
+    private fun onUser(text: String) {
+        append("You: $text")
+        handle(text.lowercase(Locale.ROOT).trim())
+    }
+
+    private fun has(p: String) =
+        ContextCompat.checkSelfPermission(this, p) == PackageManager.PERMISSION_GRANTED
+
+    private fun askPermissions() {
+        val want = mutableListOf(
+            Manifest.permission.CALL_PHONE,
+            Manifest.permission.READ_CONTACTS,
+            Manifest.permission.ANSWER_PHONE_CALLS,
+            Manifest.permission.READ_PHONE_STATE
+        )
+        if (Build.VERSION.SDK_INT >= 33) want.add(Manifest.permission.POST_NOTIFICATIONS)
+        val missing = want.filter { !has(it) }
+        if (missing.isNotEmpty()) permLauncher.launch(missing.toTypedArray())
+    }
+
+    // ---------------------------------------------------------------- routing
+
+    private fun handle(raw: String) {
+        val c = raw.replace(Regex("^(hey |ok |okay )?jarvis[, ]*"), "").trim()
+        if (c.isEmpty()) return
+
+        if (Regex("^(cancel|never mind|nevermind|forget it)").containsMatchIn(c)) {
+            awaiting = null
+            say("Cancelled.")
+            return
+        }
+        when (awaiting) {
+            "call_name" -> { resolveContact(c); return }
+            "call_confirm" -> { confirmCall(c); return }
+        }
+
+        val call = Regex("^(call|phone|dial|ring)\\b\\s*(up\\s+)?(.*)$").find(c)
+        when {
+            call != null -> {
+                val name = call.groupValues[3].trim()
+                if (name.isEmpty()) {
+                    awaiting = "call_name"
+                    say("Who would you like me to call?")
+                } else resolveContact(name)
+            }
+            Regex("^(hello|hi|hey)\\b|^good (morning|afternoon|evening)").containsMatchIn(c) ->
+                say("Hello. How can I help?")
+            c.contains("help") || c.contains("what can you do") -> helpText()
+            Regex("(decline|reject|hang up|end (the |this )?call|cut (the |this )?call)").containsMatchIn(c) -> endCall()
+            Regex("^(answer|pick up|accept) (the |this )?(call|phone)").containsMatchIn(c) -> answerCall()
+            c.contains("time") && !c.contains("remind") ->
+                say("It is " + LocalTime.now().format(DateTimeFormatter.ofPattern("h:mm a")) + ".")
+            c.contains("date") || c.contains("what day") || c == "today" ->
+                say("Today is " + LocalDate.now().format(DateTimeFormatter.ofPattern("EEEE, MMMM d, yyyy")) + ".")
+            Regex("^set (my )?city to (.+)$").containsMatchIn(c) -> {
+                val city = Regex("^set (my )?city to (.+)$").find(c)!!.groupValues[2].trim()
+                prefs.edit().putString("city", city).apply()
+                say("Your city is now $city.")
+            }
+            c.contains("weather") || c.contains("temperature") || c.contains("forecast") -> {
+                val m = Regex("(?:in|for|at)\\s+([a-z\\s]+)$").find(c)
+                weather(m?.groupValues?.get(1)?.trim() ?: prefs.getString("city", "Colombo")!!)
+            }
+            c.startsWith("remind me") || c.startsWith("set a reminder") -> remind(c)
+            Regex("^(add (a )?task|new task|add to my list|add to do)").containsMatchIn(c) ->
+                addTask(c.replace(Regex("^(add (a )?task|new task|add to my list|add to do)\\s*(to\\s+)?"), "").trim().ifEmpty { "untitled task" })
+            Regex("list tasks|my tasks|show tasks|to.?do list|on my list").containsMatchIn(c) -> listTasks()
+            Regex("^(complete task|finish task|done with|mark done|remove task)").containsMatchIn(c) ->
+                completeTask(c.replace(Regex("^(complete task|finish task|done with|mark done|remove task)\\s*"), "").trim())
+            Regex("clear (completed|done)").containsMatchIn(c) -> clearDone()
+            Regex("^(search for |search |google |look up )").containsMatchIn(c) ->
+                webSearch(c.replace(Regex("^(search for|search|google|look up)\\s+"), ""))
+            c.startsWith("open ") -> openApp(c.removePrefix("open ").trim())
+            else -> {
+                say("I'm not sure how to do that yet, so I'll search the web for it.")
+                webSearch(c)
+            }
+        }
+    }
+
+    private fun helpText() {
+        say(
+            "Here is what I can do. Call someone, and I'll ask who and confirm. Decline call, or hang up. " +
+                "Weather, or weather in a city. What time is it. Add task, list tasks, complete task. " +
+                "Remind me in 10 minutes to do something. Open an app. Search for something."
+        )
+    }
+
+    // ---------------------------------------------------------------- calls
+
+    private fun resolveContact(spoken: String) {
+        val digits = spoken.replace(Regex("[\\s-]"), "")
+        if (Regex("^\\+?\\d{5,15}$").matches(digits)) {
+            askConfirm(spoken, digits)
+            return
+        }
+        if (!has(Manifest.permission.READ_CONTACTS)) {
+            awaiting = null
+            say("I need permission to read your contacts. Please allow it, or give me the number.")
+            askPermissions()
+            return
+        }
+        val clean = spoken.replace(Regex("^my "), "").trim()
+        var name: String? = null
+        var number: String? = null
+        contentResolver.query(
+            ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+            arrayOf(
+                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                ContactsContract.CommonDataKinds.Phone.NUMBER
+            ),
+            ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " LIKE ?",
+            arrayOf("%$clean%"),
+            null
+        )?.use { cur ->
+            if (cur.moveToFirst()) {
+                name = cur.getString(0)
+                number = cur.getString(1)
+            }
+        }
+        val n = name
+        val num = number
+        if (n == null || num == null) {
+            awaiting = "call_name"
+            say("I couldn't find $spoken in your contacts. Tell me another name or the number, or say cancel.")
+        } else {
+            askConfirm(n, num)
+        }
+    }
+
+    private fun askConfirm(name: String, number: String) {
+        pendingName = name
+        pendingNumber = number
+        awaiting = "call_confirm"
+        say("I found $name, number $number. Shall I call?")
+    }
+
+    private fun confirmCall(c: String) {
+        when {
+            Regex("^(yes|yeah|yep|yup|sure|ok|okay|go ahead|do it|call)\\b").containsMatchIn(c) -> {
+                awaiting = null
+                placeCall()
+            }
+            Regex("^(no|nope|don't|do not|stop)\\b").containsMatchIn(c) -> {
+                awaiting = null
+                say("Okay, I won't call.")
+            }
+            else -> say("Please say yes or no. Shall I call $pendingName?")
+        }
+    }
+
+    private fun placeCall() {
+        if (!packageManager.hasSystemFeature(PackageManager.FEATURE_TELEPHONY)) {
+            say("This tablet has no phone hardware, so it can't place normal calls. A SIM-enabled phone can.")
+            return
+        }
+        if (!has(Manifest.permission.CALL_PHONE)) {
+            say("I need the phone permission to place calls. Please allow it and ask again.")
+            askPermissions()
+            return
+        }
+        say("Calling $pendingName.")
+        try {
+            startActivity(Intent(Intent.ACTION_CALL, Uri.parse("tel:" + Uri.encode(pendingNumber))))
+        } catch (e: SecurityException) {
+            say("Android blocked the call.")
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun endCall() {
+        if (!has(Manifest.permission.ANSWER_PHONE_CALLS)) {
+            say("I need the phone permission to end calls.")
+            askPermissions()
+            return
+        }
+        val tm = getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+        try {
+            val ok = tm.endCall()
+            say(if (ok) "Call ended." else "There is no active or ringing call.")
+        } catch (e: SecurityException) {
+            say("This device doesn't let me end calls.")
+        }
+    }
+
+    private fun answerCall() {
+        if (!has(Manifest.permission.ANSWER_PHONE_CALLS)) {
+            say("I need the phone permission to answer calls.")
+            askPermissions()
+            return
+        }
+        val tm = getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+        try {
+            tm.acceptRingingCall()
+            say("Answering.")
+        } catch (e: SecurityException) {
+            say("This device doesn't let me answer calls.")
+        }
+    }
+
+    // ---------------------------------------------------------------- weather
+
+    private fun httpGet(url: String): String {
+        val conn = URL(url).openConnection() as HttpURLConnection
+        conn.connectTimeout = 8000
+        conn.readTimeout = 8000
+        conn.setRequestProperty("User-Agent", "JarvisAssistant")
+        return conn.inputStream.bufferedReader().use { it.readText() }
+    }
+
+    private fun describe(code: Int): String = when (code) {
+        0 -> "clear skies"
+        1, 2 -> "mostly clear to partly cloudy skies"
+        3 -> "overcast skies"
+        45, 48 -> "fog"
+        in 51..57 -> "drizzle"
+        in 61..67 -> "rain"
+        in 71..77 -> "snow"
+        in 80..82 -> "rain showers"
+        85, 86 -> "snow showers"
+        in 95..99 -> "thunderstorms"
+        else -> "mixed conditions"
+    }
+
+    private fun weather(city: String) {
+        say("Checking the weather in $city.")
+        Thread {
+            val reply = try {
+                val geo = JSONObject(
+                    httpGet("https://geocoding-api.open-meteo.com/v1/search?count=1&name=" + URLEncoder.encode(city, "UTF-8"))
+                )
+                val results = geo.optJSONArray("results")
+                if (results == null || results.length() == 0) {
+                    "I couldn't find a place called $city."
+                } else {
+                    val p = results.getJSONObject(0)
+                    val url = "https://api.open-meteo.com/v1/forecast?latitude=${p.getDouble("latitude")}" +
+                        "&longitude=${p.getDouble("longitude")}" +
+                        "&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m" +
+                        "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max" +
+                        "&timezone=auto&forecast_days=1"
+                    val j = JSONObject(httpGet(url))
+                    val cur = j.getJSONObject("current")
+                    val d = j.getJSONObject("daily")
+                    val hi = Math.round(d.getJSONArray("temperature_2m_max").getDouble(0))
+                    val lo = Math.round(d.getJSONArray("temperature_2m_min").getDouble(0))
+                    val rain = d.getJSONArray("precipitation_probability_max").optInt(0, 0)
+                    "In ${p.getString("name")} it is ${Math.round(cur.getDouble("temperature_2m"))} degrees Celsius " +
+                        "with ${describe(cur.getInt("weather_code"))}, feels like ${Math.round(cur.getDouble("apparent_temperature"))}. " +
+                        "Humidity ${cur.getInt("relative_humidity_2m")} percent. " +
+                        "Today's high is $hi and low is $lo, with a $rain percent chance of rain."
+                }
+            } catch (e: Exception) {
+                "I couldn't reach the weather service. Check your internet connection."
+            }
+            runOnUiThread { say(reply) }
+        }.start()
+    }
+
+    // ---------------------------------------------------------------- tasks
+
+    private fun loadTasks(): JSONArray =
+        try { JSONArray(prefs.getString("tasks", "[]")) } catch (e: Exception) { JSONArray() }
+
+    private fun saveTasks(a: JSONArray) {
+        prefs.edit().putString("tasks", a.toString()).apply()
+    }
+
+    private fun addTask(text: String) {
+        val a = loadTasks()
+        a.put(JSONObject().put("t", text).put("d", false))
+        saveTasks(a)
+        say("Added to your list: $text.")
+    }
+
+    private fun pendingIndexes(a: JSONArray): List<Int> =
+        (0 until a.length()).filter { !a.getJSONObject(it).optBoolean("d", false) }
+
+    private fun listTasks() {
+        val a = loadTasks()
+        val idx = pendingIndexes(a)
+        if (idx.isEmpty()) {
+            say("Your task list is empty.")
+            return
+        }
+        val items = idx.mapIndexed { n, i -> "${n + 1}, ${a.getJSONObject(i).getString("t")}" }
+        say("You have ${idx.size} task${if (idx.size == 1) "" else "s"}. " + items.joinToString(". ") + ".")
+    }
+
+    private fun completeTask(q: String) {
+        val a = loadTasks()
+        val idx = pendingIndexes(a)
+        val target: Int? = if (Regex("^\\d+$").matches(q)) {
+            idx.getOrNull(q.toInt() - 1)
+        } else if (q.isNotEmpty()) {
+            idx.firstOrNull { a.getJSONObject(it).getString("t").lowercase(Locale.ROOT).contains(q) }
+        } else null
+        if (target == null) {
+            say("I couldn't find that task.")
+            return
+        }
+        a.getJSONObject(target).put("d", true)
+        saveTasks(a)
+        say("Marked done: ${a.getJSONObject(target).getString("t")}.")
+    }
+
+    private fun clearDone() {
+        val a = loadTasks()
+        val keep = JSONArray()
+        for (i in pendingIndexes(a)) keep.put(a.getJSONObject(i))
+        saveTasks(keep)
+        say("Cleared completed tasks.")
+    }
+
+    // ---------------------------------------------------------------- reminders
+
+    private fun remind(c: String) {
+        val re = Regex("\\b(?:in\\s+)?(\\d+|an|a)\\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?)\\b")
+        val m = re.find(c)
+        if (m == null) {
+            say("Tell me when, for example: remind me in 10 minutes to call mom.")
+            return
+        }
+        val g1 = m.groupValues[1]
+        val n = if (g1 == "a" || g1 == "an") 1L else g1.toLong()
+        val secs = when (m.groupValues[2][0]) {
+            's' -> n
+            'm' -> n * 60
+            else -> n * 3600
+        }
+        val what = c.replace(Regex("^(remind me|set a reminder)\\s*"), "")
+            .replace(re, " ")
+            .replace(Regex("^\\s*(to|that|about)\\s+"), "")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+            .ifEmpty { "your reminder" }
+
+        val am = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val pi = PendingIntent.getBroadcast(
+            this,
+            (System.currentTimeMillis() % Int.MAX_VALUE).toInt(),
+            In
